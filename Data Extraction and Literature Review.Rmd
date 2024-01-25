@@ -1,0 +1,297 @@
+---
+title: "litsearchr"
+author: "Dominika"
+date: "2023-12-12"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggraph)
+library(igraph)
+library(readr)
+```
+
+```{r}
+library(litsearchr)
+```
+
+Read in search files
+
+```{r}
+naive_results <- import_results(file="C:/Users/DominikaOliver/Downloads/pubmed-militaries-set.nbib")
+
+#number of rows
+nrow(naive_results)
+
+#shows results
+head(naive_results)
+str(naive_results)
+```
+Keywords
+```{r}
+
+#missing keywords
+sum(is.na(naive_results[, "keywords"]))
+
+#Extract Keywords that were tagged by the authors
+extract_terms(keywords=naive_results[, "keywords"], method="tagged")
+
+#creates a list of keywords
+keywords <- extract_terms(keywords=naive_results[, "keywords"], method="tagged", min_n=2)
+
+keywords
+```
+
+Title and Abstract:  Create a list of terms that can be used as keywords.  
+
+```{r}
+#Extract interesting words from titles
+extract_terms(text=naive_results[, "title"], method="fakerake", min_freq=3, min_n=2)
+
+#Create a list of stopwords.  This is the generic list, but we can also create our own and bind it to our generic stopword list by reading in a text file.  
+all_stopwords <- get_stopwords("English")
+
+#This creates that list of titles.  
+
+title_terms <- extract_terms(
+  text=naive_results[, "title"],
+  method="fakerake",
+  min_freq=3, min_n=2,
+  stopwords=all_stopwords
+)
+
+title_terms
+
+#Let's combine our keywords into one list
+terms <- unique(c(keywords, title_terms))
+
+```
+Network Analysis
+
+One way to do this is to analyze the search terms as a network. The idea behind this is that terms are linked to each other by virtue of appearing in the same articles.
+
+```{r}
+docs <- paste(naive_results[, "title"], naive_results[, "abstract"])
+
+docs[1]
+
+#Creates a Document Term Matrix which has the document/title as the columns, and the terms as the row.
+dfm <- create_dfm(elements=docs, features=terms)
+
+#Create a network analysis.  THese terms must appear in at least 3 studies.  
+g <- create_network(dfm, min_studies=10)
+
+#Create graphics of the terms
+ggraph(g, layout="stress") +
+  coord_fixed() +
+  expand_limits(x=c(-3, 3)) +
+  geom_edge_link(aes(alpha=weight)) +
+  geom_node_point(shape="circle filled", fill="white") +
+  geom_node_text(aes(label=name), hjust="outward", check_overlap=TRUE) +
+  guides(edge_alpha=FALSE)
+```
+Terms that appear near the center of the graph and that are linked to each other by darker lines are probably more important for our overall topic. Here these include for example cbt, phobia, and behavioral therapy.
+
+Terms that appear at the periphery of the graph and linked to it only by faint lines are not closely related to any other terms. These are mostly tangential terms that are related to, but not part of, our main topic, for example functional magnetic resonance imaging and emotion regulation.
+
+We want to make sure that we are keeping the strongest terms.  We can do this via looking at term strength organized from min to max.
+
+```{r}
+strengths <- strength(g)
+
+data.frame(term=names(strengths), strength=strengths, row.names=NULL) %>%
+  mutate(rank=rank(strength, ties.method="min")) %>%
+  arrange(strength) ->
+  term_strengths
+
+term_strengths
+```
+
+Using these, we can create a cutoff figure.  
+
+```{r}
+cutoff_fig <- ggplot(term_strengths, aes(x=rank, y=strength, label=term)) +
+  geom_line() +
+  geom_point() +
+  geom_text(data=filter(term_strengths, rank>5), hjust="right", nudge_y=20, check_overlap=TRUE)
+
+
+
+cutoff_fig
+```
+Cumulatively
+One simple way to decide on a cutoff is to choose to retain a certain proportion of the total strength of the network of search terms, for example 80%. If we supply the argument method="cumulative" to the find_cutoff() function, we get the cutoff strength value according to this method. The percent argument specifies what proportion of the total strength we would like to retain.
+
+```{r}
+cutoff_cum <- find_cutoff(g, method="cumulative", percent=0.8)
+
+cutoff_cum
+
+cutoff_fig +
+  geom_hline(yintercept=cutoff_cum, linetype="dashed")
+
+
+```
+
+With this, we can prune our keyword search to the most relevent keywords.
+
+```{r}
+get_keywords(reduce_graph(g, cutoff_cum))
+```
+
+Changepoints
+Looking at the figure above, another method of pruning away terms suggests itself. There are certain points along the ranking of terms where the strength of the next strongest term is much greater than that of the previous one (places where the ascending line ‘jumps up’). We could use these places as cutoffs, since the terms below them have much lower strength than those above. There may of course be more than one place where term strength jumps up like this, so we will have multiple candidates for cutoffs. The same find_cutoff() function with the argument method="changepoint" will find these cutoffs. The knot_num argument specifies how many ‘knots’ we wish to slice the keywords into.
+
+```{r}
+cutoff_change <- find_cutoff(g, method="changepoint", knot_num=3)
+
+cutoff_change
+
+cutoff_fig +
+  geom_hline(yintercept=cutoff_change, linetype="dashed")
+```
+
+
+```{r}
+g_redux <- reduce_graph(g, cutoff_change[2])
+selected_terms <- get_keywords(g_redux)
+
+selected_terms
+```
+
+Grouping
+Now that we have got a revised list of search terms from the results of our naive search, we want to turn them into a new search query that we can use to get more articles relevant to the same topic. For this new, hopefully more rigorous, search we will need a combination of OR and AND operators. The OR operator should combine search terms that are all about the same subtopic, so that we get articles that contain any one of them. The AND operator should combine these groups of search terms so that we get only articles that mention at least one term from each of the subtopics that we are interested in.
+
+```{r}
+grouped_terms <-list(
+  military=selected_terms[c(4, 7, 10, 12)],
+  health=selected_terms[c(2, 3, 4, 9, 10, 15)],
+  sdesign=selected_terms[c(1, 8, 10, 11)],
+  healthmetrics=selected_terms[c(2, 5, 6)]
+)
+
+grouped_terms
+
+
+```
+
+Writing a new search
+
+```{r}
+write_search(
+  grouped_terms,
+  languages="English",
+  exactphrase=TRUE,
+  stemming=FALSE,
+  closure="left",
+  writesearch=TRUE
+)
+
+cat(read_file("search-inEnglish.txt"))
+```
+
+```{r}
+new_results <- import_results(file="C:/Users/DominikaOliver/Downloads/pubmed-militaryhe-set.nbib")
+nrow(new_results)
+```
+
+Comparing results
+```{r}
+naive_results %>%
+  mutate(in_new_results=title %in% new_results[, "title"]) ->
+  naive_results
+
+naive_results %>%
+  filter(!in_new_results) %>%
+  select(title, keywords)
+```
+
+
+```{r}
+pubmed_resutls <- litsearchr::import_results(file="C:/Users/DominikaOliver/Downloads/pubmed-m.nbib")
+
+
+#number of rows
+nrow(pubmed_resutls)
+
+#shows results
+head(pubmed_resutls)
+str(pubmed_resutls)
+```
+
+```{r}
+pubmed_resutls <- litsearchr::import_results(file="C:/Users/DominikaOliver/Downloads/pmmilhealth.nbib")
+
+
+#number of rows
+nrow(pubmed_resutls)
+
+#shows results
+head(pubmed_resutls)
+str(pubmed_resutls)
+```
+
+I have been having problems loading some of these files so I'm looking at alternatives
+
+```{r}
+library(pubmedR)
+```
+
+```{r}
+api_key <- NULL
+
+query1 <- "military health*[MeSH Terms] OR military health services*[All Fields] OR military health system*[All Fields]) AND (patient satisfaction*[MeSH Terms]  AND 2015/01/01:3000/12/31[Date - Publication]"
+
+query <- "(((military health services*[MeSH Terms] OR (military*[All Fields] AND health*[All Fields] AND services*[All Fields]) OR military health services*[All Fields] OR (military*[All Fields] AND health*[All Fields] AND system*[All Fields]) OR military health system*[All Fields]) AND (patient satisfaction*[MeSH Terms] OR (patient*[All Fields] AND satisfaction*[All Fields]) OR patient satisfaction*[All Fields])) AND (fft[Filter])) AND ((2015/01/01[Date - Publication] : 3000[Date - Publication]))"
+
+
+res <- pmQueryTotalCount(query = query, api_key = api_key)
+
+res$total_count
+
+#Metadata
+D <- pmApiRequest(query = query, limit = res$total_count, api_key = NULL)
+
+M <- pmApi2df(D)
+
+str(M)
+
+#lets create a data frame with what we need.  
+
+Pubmedquery <- M[, c("AU", "TI", "SO_CO", "AB")]
+
+write.csv(Pubmedquery, "Pubmed_Military_Health_Query_001.csv")
+
+```
+
+```{r}
+
+
+query <- "((improving patient experience) AND ((2015/01/01[Date - Publication] : 3000[Date - Publication]))) AND (military*[MeSH Terms])"
+
+res <- pmQueryTotalCount(query = query, api_key = api_key)
+
+res$total_count
+
+#Metadata
+D <- pmApiRequest(query = query, limit = res$total_count, api_key = NULL)
+
+M <- pmApi2df(D)
+
+str(M)
+
+#lets create a data frame with what we need.  
+
+Pubmedquery <- M[, c("AU", "TI", "SO_CO", "AB", "PMID")]
+
+write.csv(Pubmedquery, "Pubmed_Military_Health_Query_005.csv")
+                                                        ```
+
